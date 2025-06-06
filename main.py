@@ -2,7 +2,6 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms, models
@@ -11,6 +10,7 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.metrics import f1_score, roc_auc_score
+
 
 # Dataset class
 class ChestXrayDataset(Dataset):
@@ -29,6 +29,7 @@ class ChestXrayDataset(Dataset):
         label = torch.tensor(self.labels[idx], dtype=torch.float32)
         return image, label
 
+
 # Load data
 def load_data(data_dir, labels_file):
     df = pd.read_csv(labels_file)
@@ -37,7 +38,8 @@ def load_data(data_dir, labels_file):
     labels = mlb.fit_transform(df['Finding Labels'].str.split('|'))
     return df['Path'].tolist(), labels, mlb.classes_
 
-# Class imbalance handling
+
+# Handle class imbalance
 def compute_pos_weights(labels):
     labels_np = np.array(labels)
     label_counts = labels_np.sum(axis=0)
@@ -45,7 +47,8 @@ def compute_pos_weights(labels):
     pos_weight = (total - label_counts) / (label_counts + 1e-6)
     return torch.tensor(np.clip(pos_weight, 1.0, 100.0), dtype=torch.float32)
 
-# Metrics evaluator
+
+# Evaluation
 def evaluate_model(model, dataloader, device, class_names, threshold=0.5):
     model.eval()
     all_preds, all_targets = [], []
@@ -55,9 +58,6 @@ def evaluate_model(model, dataloader, device, class_names, threshold=0.5):
             outputs = torch.sigmoid(model(inputs))
             all_preds.append(outputs.cpu().numpy())
             all_targets.append(labels.cpu().numpy())
-            del inputs, labels, outputs
-    torch.cuda.empty_cache()
-
     y_pred = np.vstack(all_preds)
     y_true = np.vstack(all_targets)
     y_bin = (y_pred >= threshold).astype(int)
@@ -74,8 +74,8 @@ def evaluate_model(model, dataloader, device, class_names, threshold=0.5):
     print(f"\n✅ Macro F1: {f1_score(y_true, y_bin, average='macro', zero_division=0):.4f}")
     print(f"✅ Micro F1: {f1_score(y_true, y_bin, average='micro', zero_division=0):.4f}")
 
+
 # Training loop
-scaler = GradScaler()
 def train_model(model, criterion, optimizer, scheduler, dataloaders, device, num_epochs=50, patience=7):
     best_loss = float('inf')
     best_model_wts = model.state_dict()
@@ -90,16 +90,12 @@ def train_model(model, criterion, optimizer, scheduler, dataloaders, device, num
                 inputs, labels = inputs.to(device), labels.to(device)
                 optimizer.zero_grad()
                 with torch.set_grad_enabled(phase == 'train'):
-                    with autocast():
-                        outputs = model(inputs)
-                        loss = criterion(outputs, labels)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
                     if phase == 'train':
-                        scaler.scale(loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
+                        loss.backward()
+                        optimizer.step()
                 running_loss += loss.item() * inputs.size(0)
-                del inputs, labels, outputs, loss
-            torch.cuda.empty_cache()
 
             epoch_loss = running_loss / len(dataloaders[phase].dataset)
             print(f"Epoch {epoch+1}/{num_epochs} - {phase} Loss: {epoch_loss:.4f}")
@@ -120,47 +116,48 @@ def train_model(model, criterion, optimizer, scheduler, dataloaders, device, num
     model.load_state_dict(best_model_wts)
     return model
 
-# Paths
-data_dir = 'full_data'
-labels_file = 'Data_Entry_2017.csv'
 
-# Load
-image_paths, labels, class_names = load_data(data_dir, labels_file)
+# MAIN PIPELINE
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
 
-# Transforms
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
+    # Paths
+    data_dir = 'full_data'
+    labels_file = 'Data_Entry_2017.csv'
 
-# Datasets and loaders
-split_idx = int(0.9 * len(image_paths))
-train_dataset = ChestXrayDataset(image_paths[:split_idx], labels[:split_idx], transform)
-val_dataset = ChestXrayDataset(image_paths[split_idx:], labels[split_idx:], transform)
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
-dataloaders = {'train': train_loader, 'val': val_loader}
+    # Load data
+    image_paths, labels, class_names = load_data(data_dir, labels_file)
 
-# Setup model
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = models.densenet169(weights=models.DenseNet169_Weights.DEFAULT)
+    # Transforms
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
 
-# Freeze early layers
-for param in model.features.parameters():
-    param.requires_grad = False
+    # Datasets & Loaders
+    split_idx = int(0.9 * len(image_paths))
+    train_dataset = ChestXrayDataset(image_paths[:split_idx], labels[:split_idx], transform)
+    val_dataset = ChestXrayDataset(image_paths[split_idx:], labels[split_idx:], transform)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+    dataloaders = {'train': train_loader, 'val': val_loader}
 
-num_ftrs = model.classifier.in_features
-model.classifier = nn.Linear(num_ftrs, len(class_names))
-model = model.to(device)
+    # Model setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = models.densenet169(weights=models.DenseNet169_Weights.DEFAULT)
+    num_ftrs = model.classifier.in_features
+    model.classifier = nn.Linear(num_ftrs, len(class_names))
+    model = model.to(device)
 
-# Training tools
-pos_weight = compute_pos_weights(labels).to(device)
-criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
+    # Loss and optimizer
+    pos_weight = compute_pos_weights(labels).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
 
-# Train
-model = train_model(model, criterion, optimizer, scheduler, dataloaders, device)
+    # Train
+    model = train_model(model, criterion, optimizer, scheduler, dataloaders, device)
 
-# Final evaluation
-evaluate_model(model, val_loader, device, class_names)
+    # Evaluate
+    evaluate_model(model, val_loader, device, class_names)
